@@ -1,80 +1,68 @@
-# network.py
 import socket
 import json
-import random
 import time
+import random
 import threading
-import errno
 
-CLIENT_PORT = 5000
-SERVER_HOST = "127.0.0.1"
-SERVER_PORT = 6000
-NW_HOST = "127.0.0.1"
-NW_PORT = 5500
-
-def handle_client(conn):
+def handle_client_to_server(data, client_conn):
+    """Forward message from client to time server with delay"""
     try:
-        data = conn.recv(1024)
-        if not data:
-            conn.close()
-            return
-
-        # Add random network delay (client->server)
+        # Add random delay (0.1 to 0.5 ms)
+        delay = random.uniform(0.0001, 0.0005)  # Convert ms to seconds
+        time.sleep(delay)
+        
+        # Forward to time server
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.connect(('localhost', 5001))
+        server_socket.sendall(data.encode('utf-8'))
+        
+        # Receive response from time server
+        response = server_socket.recv(1024)
+        server_socket.close()
+        
+        # Add random delay for return path
         delay = random.uniform(0.0001, 0.0005)
         time.sleep(delay)
-
-        # Forward to time server (with error handling)
-        response = None
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(1.0)
-                s.connect((SERVER_HOST, SERVER_PORT))
-                s.sendall(data)
-                response = s.recv(1024)
-        except Exception as e:
-            print(f"[NW] error forwarding to time server: {e}")
-
-        # Add another random delay before returning (server->client)
-        delay = random.uniform(0.0001, 0.0005)
-        time.sleep(delay)
-
-        if response:
-            try:
-                conn.sendall(response)
-            except Exception as e:
-                print(f"[NW] failed to send response to client: {e}")
+        
+        # Forward response back to client
+        client_conn.sendall(response)
+        
+        print(f"[Network Server] Message forwarded with delays")
+        
     except Exception as e:
-        print(f"[NW] unexpected error handling client: {e}")
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        print(f"[Network Server] Error: {e}")
 
-def run_network_server():
-    # create, set reuseaddr, and attempt to bind with a few retries if address is busy
-    s = None
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind((NW_HOST, NW_PORT))
-            s.listen(5)
-            print(f"[NW Server] Listening on {NW_HOST}:{NW_PORT}")
-            break
-        except OSError as e:
-            if e.errno == errno.EADDRINUSE and attempt < max_attempts:
-                print(f"[NW] Address in use, retrying ({attempt}/{max_attempts})...")
-                time.sleep(0.5)
-                continue
-            else:
-                print(f"[NW] Failed to bind {NW_HOST}:{NW_PORT}: {e}")
-                raise
-
+def main():
+    host = 'localhost'
+    port = 5000
+    
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_socket.bind((host, port))
+    server_socket.listen(5)
+    
+    print(f"[Network Server] Started on {host}:{port}")
+    
     while True:
-        conn, addr = s.accept()
-        threading.Thread(target=handle_client, args=(conn,)).start()
+        try:
+            conn, addr = server_socket.accept()
+            data = conn.recv(1024).decode('utf-8')
+            
+            if not data:
+                conn.close()
+                continue
+            
+            # Handle in separate thread to allow concurrent requests
+            thread = threading.Thread(target=handle_client_to_server, args=(data, conn))
+            thread.start()
+            
+        except KeyboardInterrupt:
+            print("\n[Network Server] Shutting down...")
+            break
+        except Exception as e:
+            print(f"[Network Server] Error: {e}")
+    
+    server_socket.close()
 
-if __name__ == "__main__":
-    run_network_server()
+if __name__ == '__main__':
+    main()
