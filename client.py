@@ -41,16 +41,12 @@ class Client:
         self.rho = rho
         self.duration = duration
         
-        # Initialize actual_time baseline
-        # This represents a "perfect" clock synchronized with the server
-        self.actual_time_base = time.time()
-        self.actual_time_mono_base = time.monotonic()
-        self.actual_time_lock = threading.Lock()
+        # Remove actual_time_base and related variables
+        # We don't need them!
         
         self.clock = DriftClock(rho)
         self.running = True
         
-        # Calculate synchronization interval
         self.sync_interval = self.calculate_sync_interval()
         
         print(f"[CLIENT] Initialized")
@@ -93,34 +89,27 @@ class Client:
     def request_time_sync(self):
         """Request time from server via network using Cristian's Algorithm"""
         try:
-            # Record time when request is sent
             T0 = time.monotonic()
             
-            # Connect to network server
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.connect((NETWORK_HOST, NETWORK_PORT))
             
-            # Send request
             request = {'type': 'time_req'}
             sock.sendall(json.dumps(request).encode('utf-8'))
             
-            # Receive response
             response = sock.recv(1024).decode('utf-8')
-            T1 = time.monotonic()  # Record time when response received
+            T1 = time.monotonic()
             
             sock.close()
             
-            # Parse response
             data = json.loads(response)
             T_server = data['server_time']
             
-            # Cristian's Algorithm: estimate current server time
             RTT = T1 - T0
             estimated_server_time = T_server + RTT / 2
             
-            # Update both the drifting local clock AND the perfect actual_time baseline
+            # ONLY update the local drifting clock, nothing else!
             self.clock.set_local_time(estimated_server_time)
-            self.update_actual_time_base(estimated_server_time)
             
             print(f"[CLIENT] Synced. RTT: {RTT*1000:.3f}ms, Server time: {T_server:.3f}")
             
@@ -130,20 +119,47 @@ class Client:
             print(f"[CLIENT] Sync failed: {e}")
             return False
     
+    def sync_thread_continuous(self):
+        """Thread to periodically sync (initial sync already done)"""
+        sync_count = 1  # We already did initial sync
+        
+        start_time = time.monotonic()
+        next_sync = start_time + self.sync_interval
+
+        while self.running:
+            current_time = time.monotonic()
+
+            if (current_time - start_time) >= self.duration:
+                break
+
+            if current_time >= next_sync:
+                sync_count += 1
+                print(f"[CLIENT] Performing sync #{sync_count}")
+                self.request_time_sync()
+                next_sync = start_time + sync_count * self.sync_interval
+
+            time.sleep(min(0.1, max(0, next_sync - current_time)))
+
+        print(f"[CLIENT] Total syncs performed: {sync_count}")
+    
     def logging_thread(self, csv_file):
         """Thread to log actual_time and local_time once per second"""
         with open(csv_file, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(['actual_time', 'local_time'])
 
-            start_wall = time.time()
+            # actual_time: reference clock set once and never adjusted
+            actual_time_start = time.time()
             start_mono = time.monotonic()
             last_logged = 0
 
             while self.running and (time.monotonic() - start_mono) < self.duration:
                 elapsed = int(time.monotonic() - start_mono)
-                if elapsed > last_logged:  # only once per second
-                    actual_time = start_wall + elapsed  # keeps consistent epoch-based increment
+                if elapsed > last_logged:
+                    # Actual time: perfect clock increments
+                    actual_time = actual_time_start + elapsed
+                    
+                    # Local time: drifting clock that gets synchronized
                     local_time = self.clock.get_local_time()
 
                     writer.writerow([f"{actual_time:.3f}", f"{local_time:.3f}"])
@@ -168,7 +184,6 @@ class Client:
         while self.running:
             current_time = time.monotonic()
 
-            # stop if duration elapsed
             if (current_time - start_time) >= self.duration:
                 break
 
@@ -176,7 +191,6 @@ class Client:
                 sync_count += 1
                 print(f"[CLIENT] Performing sync #{sync_count} (interval: {self.sync_interval:.2f}s)")
                 self.request_time_sync()
-                # keep sync schedule stable
                 next_sync = start_time + sync_count * self.sync_interval
 
             time.sleep(min(0.1, max(0, next_sync - current_time)))
