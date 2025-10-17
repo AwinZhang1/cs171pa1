@@ -4,181 +4,218 @@ import time
 import argparse
 import csv
 import threading
+import sys
 
-class ClockClient:
-    def __init__(self, rho, epsilon_max, duration):
-        self.rho = rho  # Clock drift ratio
-        self.epsilon_max = epsilon_max  # Maximum tolerable error
-        self.duration = duration  # Duration to run (seconds)
+NETWORK_HOST = 'localhost'
+NETWORK_PORT = 5000
+
+class DriftClock:
+    """Simulates a clock with drift"""
+    def __init__(self, rho):
+        self.rho = rho  # Drift rate
+        self.R_base = time.monotonic()  # Real monotonic clock when last set
+        # Initialize with current wall time from time.time()
+        self.L_base = time.time()  # Local clock value when last set
+        self.lock = threading.Lock()
+        print(f"[CLOCK] Initialized at L_base={self.L_base:.3f}, R_base={self.R_base:.3f}")
         
-        # Initialize local clock
-        self.R_base = time.time()  # Real process clock at initialization
-        self.L_base = self.R_base  # Local time at initialization (no drift initially)
-        
-        # Network server connection
-        self.nw_host = 'localhost'
-        self.nw_port = 5000
-        
-        # CSV file for logging
-        self.csv_file = 'output.csv'
-        self.csv_lock = threading.Lock()
-        
-        # Initialize CSV file (write header; individual rows will contain raw floats)
-        with open(self.csv_file, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['actual_time', 'local_time'])
-    
     def get_local_time(self):
-        """Calculate local clock with drift: L(t) = L_base + (R(t) - R_base) * (1 + rho)"""
-        R_t = time.time()
-        L_t = self.L_base + (R_t - self.R_base) * (1 + self.rho)
-        return L_t
+        """Get current local time with drift: L(t) = L_base + (R(t) - R_base) * (1 + rho)"""
+        with self.lock:
+            R_t = time.monotonic()
+            elapsed = R_t - self.R_base
+            L_t = self.L_base + elapsed * (1 + self.rho)
+            return L_t
     
-    def update_local_clock(self, new_local_time):
-        """Update the local clock base values"""
-        self.R_base = time.time()
-        self.L_base = new_local_time
-    
-    def request_time_sync(self):
-        """Request time from server using Cristian's Algorithm"""
-        try:
-            # Record time when request is sent
-            T0 = time.time()
-            
-            # Connect to network server
-            client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            client_socket.connect((self.nw_host, self.nw_port))
-            
-            # Send time request
-            request = {'type': 'time_req'}
-            client_socket.sendall(json.dumps(request).encode('utf-8'))
-            
-            # Receive response
-            response_data = client_socket.recv(1024).decode('utf-8')
-            
-            # Record time when response is received
-            T1 = time.time()
-            
-            client_socket.close()
-            
-            # Parse response
-            response = json.loads(response_data)
-            server_time = response['server_time']
-            
-            # Cristian's Algorithm: estimate current time
-            # RTT = T1 - T0
-            # Estimated time = server_time + RTT/2
-            RTT = T1 - T0
-            estimated_time = server_time + RTT / 2
-            
-            # Update local clock
-            self.update_local_clock(estimated_time)
-            
-            print(f"[Client] Synchronized. RTT: {RTT*1000:.3f}ms, Server time: {server_time:.3f}, Estimated: {estimated_time:.3f}")
-            
-            return RTT
-            
-        except Exception as e:
-            print(f"[Client] Error during sync: {e}")
-            return None
-    
-    def calculate_sync_interval(self):
-        """Calculate how often to synchronize based on epsilon_max and drift"""
-        # Maximum network delay from spec: one-way between 0.1 and 0.5 ms -> round-trip worst-case ~1ms
-        max_network_delay = 0.001
+    def set_local_time(self, new_local_time):
+        """Update the local clock to a new value"""
+        with self.lock:
+            old_L = self.L_base
+            self.L_base = new_local_time
+            self.R_base = time.monotonic()
+            print(f"[CLOCK] Synced: {old_L:.3f} -> {new_local_time:.3f} (Δ={new_local_time-old_L:.3f}s)")
 
-        # Error sources:
-        # 1) Clock drift accumulates as t * |rho|
-        # 2) Network uncertainty contributes up to half the RTT
-        network_error = max_network_delay / 2
-
-        # If drift is essentially zero, sync only once at start
-        if abs(self.rho) < 1e-12:
-            sync_interval = self.duration
-            print(f"[Client] Calculated sync interval (no drift): {sync_interval:.3f}s")
-            return sync_interval
-
-        # Compute conservative sync interval so that (t * |rho| + network_error) <= epsilon_max
-        available_error = self.epsilon_max - network_error
-        if available_error <= 0:
-            # Network uncertainty alone exceeds epsilon_max: choose frequent syncs
-            raw_interval = 0.1
-            sync_interval = 0.1
-        else:
-            raw_interval = available_error / abs(self.rho)
-            # safety margin to account for scheduling and rounding
-            sync_interval = raw_interval * 0.9
-
-        # Clamp to a reasonable minimum and not exceed overall duration
-        sync_interval = max(0.1, min(sync_interval, self.duration))
-
-        print(f"[Client] Calculated sync interval: {sync_interval:.3f}s (raw {raw_interval:.3f}s, network_err={network_error:.6f})")
-        return sync_interval
-    
-    def log_time(self):
-        """Log actual time and local time to CSV"""
-        actual_time = time.time()
-        local_time = self.get_local_time()
+class Client:
+    def __init__(self, epsilon_max, rho, duration):
+        self.epsilon_max = epsilon_max
+        self.rho = rho
+        self.duration = duration
         
-        with self.csv_lock:
-            with open(self.csv_file, 'a', newline='') as f:
-                writer = csv.writer(f)
-                # Write raw float values (higher precision) so the grader can accurately check bounds
-                writer.writerow([actual_time, local_time])
-    
-    def logging_thread(self, stop_event):
-        """Thread that logs time once per second"""
-        while not stop_event.is_set():
-            self.log_time()
-            time.sleep(1.0)
-    
-    def run(self):
-        """Main client loop"""
-        print(f"[Client] Starting with rho={self.rho}, epsilon_max={self.epsilon_max}, duration={self.duration}s")
+        # Initialize actual_time baseline
+        # This represents a "perfect" clock synchronized with the server
+        self.actual_time_base = time.time()
+        self.actual_time_mono_base = time.monotonic()
+        self.actual_time_lock = threading.Lock()
         
-        # Initial synchronization
-        print("[Client] Performing initial synchronization...")
-        self.request_time_sync()
+        self.clock = DriftClock(rho)
+        self.running = True
         
         # Calculate synchronization interval
-        sync_interval = self.calculate_sync_interval()
+        self.sync_interval = self.calculate_sync_interval()
+        
+        print(f"[CLIENT] Initialized")
+        print(f"[CLIENT] Max error: {epsilon_max}s, Drift rate: {rho}")
+        print(f"[CLIENT] Sync interval: {self.sync_interval:.3f}s")
+    
+    
+    def update_actual_time_base(self, server_time):
+        """Update actual time baseline when synchronizing with server"""
+        with self.actual_time_lock:
+            self.actual_time_base = server_time
+            self.actual_time_mono_base = time.monotonic()
+        
+    def calculate_sync_interval(self):
+        """
+        Calculate how often to sync based on max tolerable error.
+        
+        After sync, drift error grows as: |ρ × t|
+        We need: |ρ × t| ≤ ε_max
+        Therefore: t ≤ ε_max / |ρ|
+        
+        Using safety factor of 2 to account for network delays:
+        sync_interval = ε_max / (2|ρ|)
+        """
+        if abs(self.rho) < 1e-10:
+            # No drift, sync every 5 seconds for network uncertainty
+            return 5.0
+        
+        # Sync interval with safety factor of 2
+        sync_interval = self.epsilon_max / (2.0 * abs(self.rho))
+        
+        # Reasonable bounds: at least 0.5s, at most half the duration
+        min_interval = 0.5
+        max_interval = max(10.0, self.duration / 2)
+        
+        sync_interval = max(min_interval, min(sync_interval, max_interval))
+        
+        return sync_interval
+    
+    def request_time_sync(self):
+        """Request time from server via network using Cristian's Algorithm"""
+        try:
+            # Record time when request is sent
+            T0 = time.monotonic()
+            
+            # Connect to network server
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect((NETWORK_HOST, NETWORK_PORT))
+            
+            # Send request
+            request = {'type': 'time_req'}
+            sock.sendall(json.dumps(request).encode('utf-8'))
+            
+            # Receive response
+            response = sock.recv(1024).decode('utf-8')
+            T1 = time.monotonic()  # Record time when response received
+            
+            sock.close()
+            
+            # Parse response
+            data = json.loads(response)
+            T_server = data['server_time']
+            
+            # Cristian's Algorithm: estimate current server time
+            RTT = T1 - T0
+            estimated_server_time = T_server + RTT / 2
+            
+            # Update both the drifting local clock AND the perfect actual_time baseline
+            self.clock.set_local_time(estimated_server_time)
+            self.update_actual_time_base(estimated_server_time)
+            
+            print(f"[CLIENT] Synced. RTT: {RTT*1000:.3f}ms, Server time: {T_server:.3f}")
+            
+            return True
+            
+        except Exception as e:
+            print(f"[CLIENT] Sync failed: {e}")
+            return False
+    
+    def logging_thread(self, csv_file):
+        """Thread to log actual_time and local_time once per second"""
+        with open(csv_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['actual_time', 'local_time'])
+
+            start_wall = time.time()
+            start_mono = time.monotonic()
+            last_logged = 0
+
+            while self.running and (time.monotonic() - start_mono) < self.duration:
+                elapsed = int(time.monotonic() - start_mono)
+                if elapsed > last_logged:  # only once per second
+                    actual_time = start_wall + elapsed  # keeps consistent epoch-based increment
+                    local_time = self.clock.get_local_time()
+
+                    writer.writerow([f"{actual_time:.3f}", f"{local_time:.3f}"])
+                    f.flush()
+
+                    last_logged = elapsed
+
+                time.sleep(0.01)
+
+        print(f"[CLIENT] Logging complete. Results saved to {csv_file}")
+
+    
+    def sync_thread(self):
+        """Thread to periodically sync with time server"""
+        print(f"[CLIENT] Performing initial sync...")
+        self.request_time_sync()
+        sync_count = 1
+
+        start_time = time.monotonic()
+        next_sync = start_time + self.sync_interval
+
+        while self.running:
+            current_time = time.monotonic()
+
+            # stop if duration elapsed
+            if (current_time - start_time) >= self.duration:
+                break
+
+            if current_time >= next_sync:
+                sync_count += 1
+                print(f"[CLIENT] Performing sync #{sync_count} (interval: {self.sync_interval:.2f}s)")
+                self.request_time_sync()
+                # keep sync schedule stable
+                next_sync = start_time + sync_count * self.sync_interval
+
+            time.sleep(min(0.1, max(0, next_sync - current_time)))
+
+        print(f"[CLIENT] Total syncs performed: {sync_count}")
+
+    
+    def run(self):
+        """Run the client"""
+        print(f"[CLIENT] Starting for {self.duration}s...")
         
         # Start logging thread
-        stop_event = threading.Event()
-        logger = threading.Thread(target=self.logging_thread, args=(stop_event,))
-        logger.daemon = True
-        logger.start()
+        log_thread = threading.Thread(target=self.logging_thread, args=('output.csv',))
+        log_thread.start()
         
-        # Run for specified duration with periodic synchronization
-        start_time = time.time()
-        last_sync = start_time
+        # Start sync thread
+        sync_t = threading.Thread(target=self.sync_thread)
+        sync_t.start()
         
-        while time.time() - start_time < self.duration:
-            current_time = time.time()
-            
-            # Check if it's time to synchronize
-            if current_time - last_sync >= sync_interval:
-                self.request_time_sync()
-                last_sync = current_time
-            
-            time.sleep(0.1)  # Small sleep to prevent busy waiting
+        # Wait for completion
+        try:
+            log_thread.join()
+            sync_t.join()
+        except KeyboardInterrupt:
+            print("\n[CLIENT] Interrupted")
+            self.running = False
         
-        # Stop logging thread
-        stop_event.set()
-        logger.join(timeout=2)
-        
-        print(f"[Client] Finished. Results written to {self.csv_file}")
+        print("[CLIENT] Finished")
 
 def main():
-    parser = argparse.ArgumentParser(description='Clock Synchronization Client')
-    parser.add_argument('--d', type=float, required=True, help='Duration to run (seconds)')
+    parser = argparse.ArgumentParser(description='Clock synchronization client')
+    parser.add_argument('--d', type=float, required=True, help='Duration in seconds')
     parser.add_argument('--epsilon', type=float, required=True, help='Maximum tolerable error')
-    parser.add_argument('--rho', type=float, required=True, help='Clock drift ratio')
+    parser.add_argument('--rho', type=float, required=True, help='Clock drift rate')
     
     args = parser.parse_args()
     
-    client = ClockClient(rho=args.rho, epsilon_max=args.epsilon, duration=args.d)
+    client = Client(epsilon_max=args.epsilon, rho=args.rho, duration=args.d)
     client.run()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
