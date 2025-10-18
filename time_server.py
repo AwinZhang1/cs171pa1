@@ -7,7 +7,6 @@ HOST = 'localhost'
 PORT = 5001
 
 def get_current_time():
-    """Return current time using time.time() as the authoritative source"""
     return time.time()
 
 def main():
@@ -16,7 +15,6 @@ def main():
     server_socket.bind((HOST, PORT))
     server_socket.listen(5)
     
-    print(f"[TIME SERVER] Started on {HOST}:{PORT}")
     
     try:
         while True:
@@ -27,14 +25,12 @@ def main():
                     request = json.loads(data)
                     
                     if request.get('type') == 'time_req':
-                        # Immediately respond with current time (processing time = 0)
                         server_time = get_current_time()
                         response = {
                             'type': 'time_resp',
                             'server_time': server_time
                         }
                         conn.sendall(json.dumps(response).encode('utf-8'))
-                        print(f"[TIME SERVER] Sent time: {server_time:.3f}")
                         
             except Exception as e:
                 print(f"[TIME SERVER] Error: {e}")
