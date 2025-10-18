@@ -79,8 +79,7 @@ class Client:
         with open(csv_file, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(['actual_time', 'local_time'])
-
-            
+        
             actual_time_start = time.time()
             start_mono = time.monotonic()
             last_logged = 0
@@ -98,7 +97,7 @@ class Client:
 
     
     def sync_thread(self):
-        self.request_time_sync()
+        
         sync_count = 1
 
         start_time = time.monotonic()
@@ -116,6 +115,8 @@ class Client:
 
     
     def run(self):
+        self.request_time_sync()
+        time.sleep(0.1)
         log_thread = threading.Thread(target=self.logging_thread, args=('output.csv',))
         log_thread.start()
         sync_t = threading.Thread(target=self.sync_thread)
